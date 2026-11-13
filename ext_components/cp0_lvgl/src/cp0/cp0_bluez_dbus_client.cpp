@@ -35,10 +35,12 @@ constexpr const char *kAgentPath = "/com/cardputerzero/applaunch/agent";
 constexpr int kCallTimeoutMs = 15000;
 constexpr int kPairTimeoutMs = 60000;
 constexpr int kConnectTimeoutMs = 30000;
+constexpr int kReconnectSettleMs = 3000;
 
 struct DeviceEntry {
     GDBusProxy *proxy = nullptr;
     cp0_bt_device_t value{};
+    gint64 incoming_connect_until = 0;
 };
 
 struct Snapshot {
@@ -210,6 +212,10 @@ private:
         cp0_bluez_dbus::Completion completion;
         bool connection_call = false;
         uint64_t generation = 0;
+        std::string connect_path{};
+        std::vector<cp0_bluez_dbus::Completion> connect_followers{};
+        GSource *connect_timer = nullptr;
+        std::string connect_error{};
     };
 
     struct PairCleanupRequest {
@@ -238,6 +244,7 @@ private:
     bool agent_registered_ = false;
     guint64 next_agent_request_id_ = 1;
     std::map<guint64, PendingAgent> agent_requests_;
+    std::map<std::string, CommandRequest *> connect_requests_;
     std::string pairing_device_path_;
     std::mutex agent_listener_mutex_;
     cp0_bluez_dbus::AgentListener agent_listener_;
@@ -362,6 +369,7 @@ private:
             g_dbus_connection_signal_unsubscribe(connection_, bluez_owner_watch_id_);
             bluez_owner_watch_id_ = 0;
         }
+        cancel_connect_waits("bluetooth worker stopped");
         unregister_agent();
         clear_cache();
         if (manager_) g_object_unref(manager_);
@@ -473,6 +481,7 @@ private:
                 self->manager_ = nullptr;
             }
             self->clear_cache();
+            self->cancel_connect_waits("bluetooth service stopped");
             self->publish();
             return;
         }
@@ -603,19 +612,29 @@ private:
     static void properties_changed(GDBusProxy *proxy, GVariant *, const gchar * const *, gpointer user_data)
     {
         auto *self = static_cast<BluezWorker *>(user_data);
+        const char *path = g_dbus_proxy_get_object_path(proxy);
+        bool connected = false;
         {
             std::lock_guard<std::mutex> lock(self->snapshot_mutex_);
-            const char *path = g_dbus_proxy_get_object_path(proxy);
             const char *name = g_dbus_proxy_get_interface_name(proxy);
             if (std::strcmp(name, kAdapter) == 0)
                 self->read_adapter(proxy);
             else if (std::strcmp(name, kDevice) == 0) {
                 auto found = self->snapshot_.devices.find(path ? path : "");
-                if (found != self->snapshot_.devices.end())
+                if (found != self->snapshot_.devices.end()) {
                     self->read_device(proxy, found->second.value);
+                    connected = found->second.value.connected;
+                    if (connected)
+                        found->second.incoming_connect_until = 0;
+                }
             }
         }
         self->publish();
+        if (connected) {
+            auto pending = self->connect_requests_.find(path);
+            if (pending != self->connect_requests_.end() && pending->second->connect_timer)
+                finish(pending->second, 0, "ok");
+        }
     }
 
     static std::string string_property(GDBusProxy *proxy, const char *name)
@@ -754,7 +773,10 @@ private:
             const char *method = nullptr;
             if (request->kind == "pair") method = "Pair";
             else if (request->kind == "cancel_pairing") method = "CancelPairing";
-            else if (request->kind == "connect") method = "Connect";
+            else if (request->kind == "connect") {
+                connect_device(request, path, found == snapshot_.devices.end() ? nullptr : &found->second);
+                return;
+            }
             else if (request->kind == "disconnect") method = "Disconnect";
             else if (request->kind == "remove") {
                 GVariant *parameters = g_variant_new("(o)", path.c_str());
@@ -782,10 +804,63 @@ private:
         return result;
     }
 
+    void connect_device(CommandRequest *request, const std::string &path, const DeviceEntry *device)
+    {
+        auto pending = connect_requests_.find(path);
+        if (pending != connect_requests_.end() && pending->second->generation == request->generation) {
+            pending->second->connect_followers.push_back(std::move(request->completion));
+            delete request;
+            return;
+        }
+        if (device && device->value.connected) {
+            finish(request, 0, "ok");
+            return;
+        }
+
+        request->connect_path = path;
+        connect_requests_[path] = request;
+        if (device && device->incoming_connect_until > g_get_monotonic_time()) {
+            // BlueZ is already authorizing this peer's incoming connection.
+            wait_for_connect(request, "Bluetooth reconnect did not complete.");
+        } else if (device) {
+            call_proxy(device->proxy, "Connect", nullptr, request);
+        } else {
+            request->connection_call = true;
+            g_dbus_connection_call(connection_, kBluez, path.c_str(), kDevice, "Connect",
+                                   nullptr, nullptr, G_DBUS_CALL_FLAGS_NONE, kConnectTimeoutMs,
+                                   command_cancellable_, method_done, request);
+        }
+    }
+
+    void wait_for_connect(CommandRequest *request, const char *error)
+    {
+        request->connect_error = error;
+        GSource *timer = g_timeout_source_new(kReconnectSettleMs);
+        request->connect_timer = timer;
+        g_source_set_callback(timer, [](gpointer data) -> gboolean {
+            auto *pending = static_cast<CommandRequest *>(data);
+            pending->connect_timer = nullptr;
+            finish(pending, -1, pending->connect_error.c_str());
+            return G_SOURCE_REMOVE;
+        }, request, nullptr);
+        g_source_attach(timer, context_);
+        g_source_unref(timer);
+    }
+
+    void cancel_connect_waits(const char *message)
+    {
+        for (auto it = connect_requests_.begin(); it != connect_requests_.end();) {
+            auto *request = (it++)->second;
+            if (request->connect_timer)
+                finish(request, -1, message);
+        }
+    }
+
     void begin_reset(CommandRequest *request)
     {
         resetting_ = true;
         ++command_generation_;
+        cancel_connect_waits("bluetooth request canceled by reset");
         g_cancellable_cancel(command_cancellable_);
         g_clear_object(&command_cancellable_);
         command_cancellable_ = g_cancellable_new();
@@ -848,7 +923,8 @@ private:
             reply = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), result, &error);
         else
             reply = g_dbus_proxy_call_finish(G_DBUS_PROXY(source), result, &error);
-        if (auto *self = instance(); !self || request->generation != self->command_generation_.load()) {
+        auto *worker = instance();
+        if (!worker || request->generation != worker->command_generation_.load()) {
             if (reply) g_variant_unref(reply);
             g_clear_error(&error);
             finish(request, -1, "bluetooth request canceled by reset");
@@ -870,6 +946,10 @@ private:
             g_dbus_error_strip_remote_error(remote_detail);
             idempotent_success = cp0::bluetooth::policy::is_idempotent_success(
                 request->kind, error_name, remote_detail->message);
+            const bool wait_for_reconnect = request->kind == "connect" &&
+                (error_name == "org.bluez.Error.InProgress" ||
+                 (error_name == "org.bluez.Error.Failed" &&
+                  std::strcmp(remote_detail->message, "br-connection-unknown") == 0));
             g_error_free(remote_detail);
 
             // Device1.Connect may wait for profile setup and time out even
@@ -877,16 +957,16 @@ private:
             // authoritative cached property instead of surfacing a false UI
             // failure in that case.
             if (request->kind == "connect") {
-                if (auto *self = instance()) {
-                    std::lock_guard<std::mutex> lock(self->snapshot_mutex_);
-                    for (const auto &item : self->snapshot_.devices) {
-                        if (cp0::bluetooth::policy::connected_snapshot_matches(
-                                request->value, item.second.value.address,
-                                item.second.value.connected)) {
-                            connect_already_established = true;
-                            break;
-                        }
-                    }
+                const auto device = worker->snapshot_.devices.find(request->connect_path);
+                connect_already_established = device != worker->snapshot_.devices.end() &&
+                                              device->second.value.connected;
+                if (!connect_already_established && wait_for_reconnect) {
+                    // The peer can finish connecting after BlueZ rejects our
+                    // outgoing request. Wait for Connected instead of retrying.
+                    worker->wait_for_connect(request, error->message);
+                    if (reply) g_variant_unref(reply);
+                    g_error_free(error);
+                    return;
                 }
             }
         }
@@ -936,16 +1016,26 @@ private:
         }
         if (reply) g_variant_unref(reply);
         if (error) g_error_free(error);
-        auto completion = std::move(request->completion);
-        if (completion) completion(code, message);
-        delete request;
+        finish(request, code, message.c_str());
     }
 
     static void finish(CommandRequest *request, int code, const char *message)
     {
-        auto completion = std::move(request->completion);
-        if (completion) completion(code, message ? message : "error");
-        delete request;
+        std::unique_ptr<CommandRequest> finished(request);
+        if (request->connect_timer)
+            g_source_destroy(request->connect_timer);
+        if (!request->connect_path.empty()) {
+            if (auto *worker = instance()) {
+                auto pending = worker->connect_requests_.find(request->connect_path);
+                if (pending != worker->connect_requests_.end() && pending->second == request)
+                    worker->connect_requests_.erase(pending);
+            }
+        }
+        const std::string result = message ? message : "error";
+        if (request->completion)
+            request->completion(code, result);
+        for (const auto &completion : request->connect_followers)
+            if (completion) completion(code, result);
     }
 
     void register_agent()
@@ -1059,10 +1149,15 @@ private:
             request.device = device ? device : "";
             {
                 std::lock_guard<std::mutex> lock(snapshot_mutex_);
-                const auto found = snapshot_.devices.find(request.device);
+                auto found = snapshot_.devices.find(request.device);
                 if (found != snapshot_.devices.end()) {
                     request.paired = found->second.value.paired != 0;
                     request.trusted = found->second.value.trusted != 0;
+                    if (request.paired && request.method == "AuthorizeService" &&
+                        !found->second.value.connected) {
+                        found->second.incoming_connect_until =
+                            g_get_monotonic_time() + kReconnectSettleMs * G_TIME_SPAN_MILLISECOND;
+                    }
                 }
             }
             if (std::strcmp(method, "RequestConfirmation") == 0 && g_variant_n_children(parameters) > 1) {
@@ -1074,6 +1169,14 @@ private:
                 g_variant_get_child(parameters, 1, "&s", &uuid);
                 request.uuid = uuid ? uuid : "";
             }
+        }
+        // Match the existing home-screen policy for services on paired
+        // devices, even while Settings has an Agent UI subscriber.
+        if (request.paired && request.method == "AuthorizeService") {
+            cp0_zmq_logf("bt", "authorize paired service device=%s uuid=%s",
+                         request.device.c_str(), request.uuid.c_str());
+            g_dbus_method_invocation_return_value(invocation, nullptr);
+            return;
         }
         agent_requests_.emplace(id, PendingAgent{request, static_cast<GDBusMethodInvocation *>(g_object_ref(invocation))});
         cp0_bluez_dbus::AgentListener listener;
