@@ -9,6 +9,7 @@
 #include "cp0_pointer_lifecycle.hpp"
 #include "cp0_status_lifecycle.hpp"
 #include "cp0_status_component_contract.hpp"
+#include "cp0_sync_signal.hpp"
 
 namespace {
 
@@ -698,8 +699,65 @@ bool AppTopBarNetworkComponent::resources_ready() const
     return cp0::status::resources_ready(resources, 6);
 }
 
+class AppTopBarBluetoothComponent final : public AppTopBarComponent
+{
+public:
+    AppTopBarBluetoothComponent() : AppTopBarComponent("cp0.bluetooth", 12) {}
+    ~AppTopBarBluetoothComponent() override { unmount(); }
+
+    void refresh() override
+    {
+        if (!label_) return;
+
+        // Both queries are synchronous reads of the Bluetooth backend's cache.
+        bool powered = false;
+        bool connected = false;
+        cp0::signal::invoke_noexcept([&] {
+            cp0_signal_bt_api({"BtStatus"}, [&](int code, std::string payload) {
+                powered = code == 0 && payload.rfind("1\t", 0) == 0;
+            });
+            if (powered) {
+                cp0_signal_bt_api({"BtConnectedList", "1"}, [&](int count, std::string) {
+                    connected = count > 0;
+                });
+            }
+        });
+
+        if (connected_ != connected) {
+            connected_ = connected;
+            lv_obj_set_style_text_color(label_, lv_color_hex(connected ? 0x58A6FF : 0x808080), 0);
+        }
+        if (visible() != powered) set_visible(powered);
+    }
+
+protected:
+    void on_create(lv_obj_t *parent) override
+    {
+        label_ = lv_label_create(parent);
+        if (!label_) return;
+        lv_obj_add_event_cb(label_, [](lv_event_t *event) {
+            auto *self = static_cast<AppTopBarBluetoothComponent *>(lv_event_get_user_data(event));
+            self->label_ = nullptr;
+        }, LV_EVENT_DELETE, this);
+        lv_label_set_text(label_, LV_SYMBOL_BLUETOOTH);
+        lv_obj_set_style_text_font(label_, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(label_, lv_color_hex(0x808080), 0);
+        lv_obj_center(label_);
+        connected_ = false;
+        set_visible(false);
+    }
+
+    void on_object_deleted() override { label_ = nullptr; }
+    bool resources_ready() const override { return label_ != nullptr; }
+
+private:
+    lv_obj_t *label_ = nullptr;
+    bool connected_ = false;
+};
+
 UIAppTopBar::UIAppTopBar()
     : title_(std::make_unique<AppTopBarTitleComponent>()),
+      bluetooth_(std::make_unique<AppTopBarBluetoothComponent>()),
       network_(std::make_unique<AppTopBarNetworkComponent>()),
       time_(std::make_unique<AppTopBarTimeComponent>()),
       battery_(std::make_unique<AppTopBarBatteryComponent>())
@@ -761,7 +819,7 @@ lv_obj_t *UIAppTopBar::create(lv_obj_t *parent)
                                                                     LV_OBJ_FLAG_SCROLLABLE));
     lv_obj_add_flag(custom_container_, LV_OBJ_FLAG_HIDDEN);
 
-    if (!network_->mount(container_) || !time_->mount(container_) ||
+    if (!bluetooth_->mount(container_) || !network_->mount(container_) || !time_->mount(container_) ||
         !battery_->mount(container_)) {
         lv_obj_delete(container_);
         return nullptr;
@@ -802,6 +860,7 @@ void UIAppTopBar::detach_from_deleted_parent()
             [component] { component->detach_from_deleted_parent(); });
     };
     detach(title_.get());
+    detach(bluetooth_.get());
     detach(network_.get());
     detach(time_.get());
     detach(battery_.get());
@@ -837,6 +896,7 @@ void UIAppTopBar::set_active(bool active)
         }
     };
     apply(title_.get());
+    apply(bluetooth_.get());
     apply(network_.get());
     apply(time_.get());
     apply(battery_.get());
@@ -879,6 +939,7 @@ bool UIAppTopBar::remove_component(const std::string &id)
 AppTopBarComponent *UIAppTopBar::component(const std::string &id) const
 {
     if (id == title_->id()) return title_.get();
+    if (id == bluetooth_->id()) return bluetooth_.get();
     if (id == network_->id()) return network_.get();
     if (id == time_->id()) return time_.get();
     if (id == battery_->id()) return battery_.get();
@@ -901,6 +962,7 @@ void UIAppTopBar::update_time()
 void UIAppTopBar::update_network()
 {
     if (!container_) return;
+    bluetooth_->refresh();
     network_->refresh();
 }
 

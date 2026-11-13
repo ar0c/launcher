@@ -20,6 +20,7 @@
 
 class AppTopBarRegion;
 class AppTopBarComponent;
+class AppTopBarBluetoothComponent;
 namespace cp0::status { class Lifecycle; }
 
 /**
@@ -384,6 +385,7 @@ private:
     lv_obj_t *container_ = nullptr;
     lv_obj_t *custom_container_ = nullptr;
     std::unique_ptr<AppTopBarTitleComponent> title_;
+    std::unique_ptr<AppTopBarBluetoothComponent> bluetooth_;
     std::unique_ptr<AppTopBarNetworkComponent> network_;
     std::unique_ptr<AppTopBarTimeComponent> time_;
     std::unique_ptr<AppTopBarBatteryComponent> battery_;
