@@ -9,7 +9,13 @@ with open(env["PROJECT_TOOL_S"]) as f:
     exec(f.read())
 
 if "CONFIG_RADIOLIB_COMPONENT_ENABLED" in os.environ:
-    radiolib = wget_github("https://github.com/jgromes/RadioLib.git")
+    revision = "72dd4f55979094dab3f9e2759e33e35019d21978"
+    # Newer RadioLib revisions changed the SPI HAL and SX1262::begin APIs.
+    archive = "RadioLib-{}.zip".format(revision)
+    archive_dir = wget_zip(
+        "https://github.com/jgromes/RadioLib/archive/{}.zip".format(revision), archive
+    )
+    radiolib = os.path.join(archive_dir, "RadioLib-{}".format(revision))
 
     SRCS = [
         os.path.join(radiolib, "src", "Hal.cpp"),
