@@ -45,8 +45,7 @@ bool is_idempotent_success(const std::string &command,
     if (is_pair_already_exists(error_name))
         return command == "pair";
     if (command == "connect")
-        return error_name == "org.bluez.Error.AlreadyConnected" ||
-               error_name == "org.bluez.Error.InProgress";
+        return error_name == "org.bluez.Error.AlreadyConnected";
     if (command == "disconnect")
         return error_name == "org.bluez.Error.NotConnected";
     if (command == "start")

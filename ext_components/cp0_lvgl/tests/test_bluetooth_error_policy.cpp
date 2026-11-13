@@ -23,7 +23,7 @@ int main()
     assert(!is_idempotent_success("pair", "org.bluez.Error.InProgress"));
 
     assert(is_idempotent_success("connect", "org.bluez.Error.AlreadyConnected"));
-    assert(is_idempotent_success("connect", "org.bluez.Error.InProgress"));
+    assert(!is_idempotent_success("connect", "org.bluez.Error.InProgress"));
     assert(!is_idempotent_success("connect", "org.bluez.Error.NotConnected"));
     assert(is_idempotent_success("disconnect", "org.bluez.Error.NotConnected"));
     assert(is_idempotent_success("start", "org.bluez.Error.InProgress"));

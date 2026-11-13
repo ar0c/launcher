@@ -22,6 +22,7 @@ IFACE_PLAYER = "org.bluez.MediaPlayer1"
 IFACE_AGENT_MANAGER = "org.bluez.AgentManager1"
 IFACE_OM = "org.freedesktop.DBus.ObjectManager"
 IFACE_PROPS = "org.freedesktop.DBus.Properties"
+IFACE_TEST = "org.bluez.MockTest"
 
 state = {
     "powered": False,
@@ -33,6 +34,9 @@ state = {
     "pairable_timeout": 0,
     "dev1_trusted": False,
     "dev1_paired": False,
+    "dev1_connected": False,
+    "connect_behavior": "",
+    "connect_count": 0,
     "registered_agent": None,
     "default_agent": None,
     "agent_capability": None,
@@ -65,7 +69,7 @@ def dev1_props():
         "Alias": dbus.String("Test Phone"),
         "Icon": dbus.String("phone"),
         "Paired": dbus.Boolean(state["dev1_paired"]),
-        "Connected": dbus.Boolean(False),
+        "Connected": dbus.Boolean(state["dev1_connected"]),
         "Trusted": dbus.Boolean(state["dev1_trusted"]),
         "Blocked": dbus.Boolean(False),
         "RSSI": dbus.Int16(-52),
@@ -275,15 +279,69 @@ class BluezObject(dbus.service.Object):
         threading.Thread(target=self._request_confirmation,
                          args=(owner, reply_cb, error_cb), daemon=True).start()
 
-    @dbus.service.method(IFACE_DEVICE, in_signature="", out_signature="")
-    def Connect(self):
-        self.PropertiesChanged(IFACE_DEVICE, {"Connected": dbus.Boolean(True)}, [])
+    @dbus.service.method(IFACE_DEVICE, in_signature="", out_signature="",
+                         async_callbacks=("reply_cb", "error_cb"))
+    def Connect(self, reply_cb, error_cb):
+        state["connect_count"] += 1
+        behavior = state["connect_behavior"]
+        if behavior == "busy":
+            error_cb(dbus.exceptions.DBusException(
+                "Connection in progress", name="org.bluez.Error.InProgress"))
+            GLib.timeout_add(200, self._finish_connect)
+            return
+        if behavior in ("race", "fail"):
+            error_cb(dbus.exceptions.DBusException(
+                "br-connection-unknown", name="org.bluez.Error.Failed"))
+            if behavior == "race":
+                GLib.timeout_add(200, self._finish_connect)
+            return
+        if behavior == "slow":
+            GLib.timeout_add(400, self._finish_connect, reply_cb)
+            return
+        self._finish_connect(reply_cb)
+
+    def _set_connected(self, connected):
+        if self._object_path == DEV1_PATH:
+            state["dev1_connected"] = connected
+        self.PropertiesChanged(IFACE_DEVICE, {"Connected": dbus.Boolean(connected)}, [])
+
+    def _finish_connect(self, reply_cb=None):
+        self._set_connected(True)
+        if reply_cb:
+            reply_cb()
+        return False
 
     @dbus.service.method(IFACE_DEVICE, in_signature="", out_signature="")
     def Disconnect(self):
-        self.PropertiesChanged(
-            IFACE_DEVICE, {"Connected": dbus.Boolean(False)}, []
-        )
+        self._set_connected(False)
+
+    @dbus.service.method(IFACE_TEST, in_signature="sb", out_signature="")
+    def ConfigureConnect(self, behavior, paired):
+        state["connect_behavior"] = str(behavior)
+        state["connect_count"] = 0
+        state["dev1_paired"] = bool(paired)
+        self._set_connected(False)
+        self.PropertiesChanged(IFACE_DEVICE, {"Paired": dbus.Boolean(paired)}, [])
+
+    @dbus.service.method(IFACE_TEST, in_signature="", out_signature="u")
+    def ConnectCount(self):
+        return dbus.UInt32(state["connect_count"])
+
+    @dbus.service.method(IFACE_TEST, in_signature="b", out_signature="",
+                         async_callbacks=("reply_cb", "error_cb"))
+    def AuthorizeService(self, reconnect, reply_cb, error_cb):
+        agent = dbus.Interface(self._bus.get_object(
+            state["agent_owner"], state["registered_agent"], introspect=False),
+            "org.bluez.Agent1")
+
+        def authorized():
+            if reconnect:
+                GLib.timeout_add(400, self._finish_connect)
+            reply_cb()
+
+        agent.AuthorizeService(dbus.ObjectPath(self._object_path),
+                               "0000110d-0000-1000-8000-00805f9b34fb",
+                               reply_handler=authorized, error_handler=error_cb)
 
     # ---- MediaPlayer1 ----
     @dbus.service.method(IFACE_PLAYER, in_signature="", out_signature="")
@@ -325,14 +383,15 @@ def main():
 
     bus_name_holder = dbus.service.BusName(BUS_NAME, bus)
 
+    root = BluezObject(bus, "/")
     BluezObject(bus, "/org/bluez")
     BluezObject(bus, ADAPTER_PATH)
     BluezObject(bus, DEV1_PATH)
     BluezObject(bus, DEV2_PATH)
-    obj = BluezObject(bus, PLAYER_PATH)
+    BluezObject(bus, PLAYER_PATH)
 
     def emit_device_added():
-        obj.InterfacesAdded(DEV1_PATH, {IFACE_DEVICE: dev1_props()})
+        root.InterfacesAdded(DEV1_PATH, {IFACE_DEVICE: dev1_props()})
         return False
 
     GLib.timeout_add(300, emit_device_added)
