@@ -15,8 +15,8 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("Cardputer Zero 投屏")]
 [assembly: AssemblyProduct("Cardputer Zero 投屏")]
 [assembly: AssemblyDescription("通过 SSH 查看和操作 Cardputer Zero 的实体屏幕")]
-[assembly: AssemblyVersion("1.0.4.0")]
-[assembly: AssemblyFileVersion("1.0.4.0")]
+[assembly: AssemblyVersion("1.0.5.0")]
+[assembly: AssemblyFileVersion("1.0.5.0")]
 
 static class Program
 {
@@ -351,13 +351,17 @@ sealed class ScreenView : Control
 
     public void ShowFrame(byte[] pixels)
     {
+        bool changed = !hasFrame;
         for (int i = 0; i < rgb.Length; i++) {
             int value = pixels[i * 2] | (pixels[i * 2 + 1] << 8);
             int red = value >> 11;
             int green = (value >> 5) & 63;
             int blue = value & 31;
-            rgb[i] = ((red << 3 | red >> 2) << 16) | ((green << 2 | green >> 4) << 8) | (blue << 3 | blue >> 2);
+            int color = ((red << 3 | red >> 2) << 16) | ((green << 2 | green >> 4) << 8) | (blue << 3 | blue >> 2);
+            changed |= rgb[i] != color;
+            rgb[i] = color;
         }
+        if (!changed) return;
         var data = image.LockBits(new Rectangle(0, 0, FrameWidth, FrameHeight), ImageLockMode.WriteOnly, PixelFormat.Format32bppRgb);
         try {
             Marshal.Copy(rgb, 0, data.Scan0, rgb.Length);
@@ -380,7 +384,9 @@ sealed class ScreenView : Control
         if (bounds.IsEmpty) return;
         e.Graphics.PixelOffsetMode = PixelOffsetMode.Half;
         if (Mode == ScreenScaleMode.TextEnhanced) {
-            e.Graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            e.Graphics.InterpolationMode = bounds.Width < FrameWidth
+                ? InterpolationMode.HighQualityBicubic
+                : InterpolationMode.Bicubic;
             e.Graphics.DrawImage(image, bounds, 0, 0, FrameWidth, FrameHeight, GraphicsUnit.Pixel, textAttributes);
         } else {
             e.Graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
