@@ -15,8 +15,8 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("Cardputer Zero 投屏")]
 [assembly: AssemblyProduct("Cardputer Zero 投屏")]
 [assembly: AssemblyDescription("通过 SSH 查看和操作 Cardputer Zero 的实体屏幕")]
-[assembly: AssemblyVersion("1.0.2.0")]
-[assembly: AssemblyFileVersion("1.0.2.0")]
+[assembly: AssemblyVersion("1.0.7.0")]
+[assembly: AssemblyFileVersion("1.0.7.0")]
 
 static class Program
 {
@@ -33,8 +33,13 @@ sealed class MirrorWindow : Form
 {
     readonly TextBox address = new TextBox { Width = 200, AccessibleName = "Zero 的 IP 地址" };
     readonly Button connect = new Button { Text = "连接", AutoSize = true };
+    readonly ComboBox scaling = new ComboBox {
+        Width = 120, DropDownStyle = ComboBoxStyle.DropDownList, AccessibleName = "画面模式"
+    };
     readonly Label status = new Label { Dock = DockStyle.Fill, AutoEllipsis = true, TextAlign = ContentAlignment.MiddleLeft };
-    readonly ScreenView screen = new ScreenView { Dock = DockStyle.Fill, TabStop = true };
+    readonly ScreenView screen = new ScreenView {
+        Dock = DockStyle.Fill, TabStop = true, Mode = ScreenScaleMode.TextEnhanced
+    };
     readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 33 };
     readonly HashSet<int> held = new HashSet<int>();
     readonly Stopwatch keepalive = Stopwatch.StartNew();
@@ -59,6 +64,9 @@ sealed class MirrorWindow : Form
         toolbar.Controls.Add(new Label { Text = "设备地址", AutoSize = true, Margin = new Padding(0, 7, 6, 0) });
         toolbar.Controls.Add(address);
         toolbar.Controls.Add(connect);
+        scaling.Items.AddRange(new object[] { "整数倍", "适应窗口", "文字增强" });
+        scaling.SelectedIndex = (int)screen.Mode;
+        toolbar.Controls.Add(scaling);
         var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3 };
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 43));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
@@ -70,6 +78,10 @@ sealed class MirrorWindow : Form
         Controls.Add(layout);
 
         connect.Click += delegate { if (session == null) StartConnection(); else Disconnect(); };
+        scaling.SelectedIndexChanged += delegate {
+            screen.Mode = (ScreenScaleMode)scaling.SelectedIndex;
+            UpdateConnectedStatus();
+        };
         address.KeyDown += delegate(object sender, KeyEventArgs args) {
             if (args.KeyCode == Keys.Enter && session == null) {
                 args.SuppressKeyPress = true;
@@ -245,36 +257,62 @@ static class DeviceAddress
     }
 }
 
+enum ScreenScaleMode
+{
+    Integer,
+    FitWindow,
+    TextEnhanced
+}
+
 sealed class ScreenView : Control
 {
     public const int FrameWidth = 320;
     public const int FrameHeight = 170;
     public const int FrameBytes = FrameWidth * FrameHeight * 2;
+    const float TextGamma = 0.68f;
     readonly Bitmap image = new Bitmap(FrameWidth, FrameHeight, PixelFormat.Format32bppRgb);
     readonly int[] rgb = new int[FrameWidth * FrameHeight];
+    readonly ImageAttributes textAttributes = new ImageAttributes();
+    readonly SharpFrameScaler textScaler = new SharpFrameScaler(FrameWidth, FrameHeight, TextGamma);
     bool hasFrame;
+    ScreenScaleMode mode;
+
+    public ScreenScaleMode Mode
+    {
+        get { return mode; }
+        set {
+            if (mode == value) return;
+            mode = value;
+            Invalidate();
+        }
+    }
 
     public string ResolutionText
     {
         get {
-            var bounds = ImageBounds(ClientSize);
-            double zoom = (double)bounds.Width / FrameWidth;
-            return String.Format("{0}×{1}   ·   {2:0.##}×", FrameWidth, FrameHeight, zoom);
+            var bounds = ImageBounds(ClientSize, Mode == ScreenScaleMode.FitWindow);
+            if (bounds.IsEmpty) return String.Format("{0}×{1}", FrameWidth, FrameHeight);
+            double zoom = Math.Max((double)bounds.Width / FrameWidth, (double)bounds.Height / FrameHeight);
+            return String.Format("{0}×{1} → {2}×{3}   ·   {4:0.##}×",
+                FrameWidth, FrameHeight, bounds.Width, bounds.Height, zoom);
         }
     }
 
-    internal static Rectangle ImageBounds(Size viewport)
+    internal static Rectangle ImageBounds(Size viewport, bool fitViewport = false)
     {
         if (viewport.Width <= 0 || viewport.Height <= 0) return Rectangle.Empty;
 
-        // Keep each source pixel the same size whenever the viewport fits the native frame.
         int zoom = Math.Min(viewport.Width / FrameWidth, viewport.Height / FrameHeight);
-        int width = FrameWidth * zoom;
-        int height = FrameHeight * zoom;
-        if (zoom == 0) {
-            double fit = Math.Min((double)viewport.Width / FrameWidth, (double)viewport.Height / FrameHeight);
-            width = Math.Max(1, (int)(FrameWidth * fit));
-            height = Math.Max(1, (int)(FrameHeight * fit));
+        int width, height;
+        if (!fitViewport && zoom > 0) {
+            width = FrameWidth * zoom;
+            height = FrameHeight * zoom;
+        } else if ((long)viewport.Width * FrameHeight <= (long)viewport.Height * FrameWidth) {
+            width = viewport.Width;
+            height = Math.Max(1, (int)((long)width * FrameHeight / FrameWidth));
+        } else {
+            height = viewport.Height;
+            width = Math.Max(1, (int)((long)height * FrameWidth / FrameHeight));
         }
         return new Rectangle((viewport.Width - width) / 2, (viewport.Height - height) / 2, width, height);
     }
@@ -286,6 +324,8 @@ sealed class ScreenView : Control
         BackColor = Color.FromArgb(15, 19, 23);
         ForeColor = Color.FromArgb(211, 220, 228);
         AccessibleName = "Zero 屏幕及远程键盘";
+        textAttributes.SetWrapMode(WrapMode.TileFlipXY);
+        textAttributes.SetGamma(TextGamma, ColorAdjustType.Bitmap);
     }
 
     protected override bool IsInputKey(Keys keyData)
@@ -313,13 +353,17 @@ sealed class ScreenView : Control
 
     public void ShowFrame(byte[] pixels)
     {
+        bool changed = !hasFrame;
         for (int i = 0; i < rgb.Length; i++) {
             int value = pixels[i * 2] | (pixels[i * 2 + 1] << 8);
             int red = value >> 11;
             int green = (value >> 5) & 63;
             int blue = value & 31;
-            rgb[i] = ((red << 3 | red >> 2) << 16) | ((green << 2 | green >> 4) << 8) | (blue << 3 | blue >> 2);
+            int color = ((red << 3 | red >> 2) << 16) | ((green << 2 | green >> 4) << 8) | (blue << 3 | blue >> 2);
+            changed |= rgb[i] != color;
+            rgb[i] = color;
         }
+        if (!changed) return;
         var data = image.LockBits(new Rectangle(0, 0, FrameWidth, FrameHeight), ImageLockMode.WriteOnly, PixelFormat.Format32bppRgb);
         try {
             Marshal.Copy(rgb, 0, data.Scan0, rgb.Length);
@@ -327,6 +371,7 @@ sealed class ScreenView : Control
             image.UnlockBits(data);
         }
         hasFrame = true;
+        textScaler.Invalidate();
         Invalidate();
     }
 
@@ -338,17 +383,154 @@ sealed class ScreenView : Control
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
             return;
         }
-        Rectangle bounds = ImageBounds(ClientSize);
+        Rectangle bounds = ImageBounds(ClientSize, Mode == ScreenScaleMode.FitWindow);
         if (bounds.IsEmpty) return;
-        e.Graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
         e.Graphics.PixelOffsetMode = PixelOffsetMode.Half;
-        e.Graphics.DrawImage(image, bounds, 0, 0, FrameWidth, FrameHeight, GraphicsUnit.Pixel);
+        if (Mode == ScreenScaleMode.TextEnhanced && bounds.Width > FrameWidth) {
+            Bitmap sharpFrame = textScaler.Render(rgb, bounds.Size);
+            e.Graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
+            e.Graphics.DrawImage(sharpFrame, bounds, 0, 0, sharpFrame.Width, sharpFrame.Height, GraphicsUnit.Pixel);
+        } else if (Mode == ScreenScaleMode.TextEnhanced) {
+            e.Graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            e.Graphics.DrawImage(image, bounds, 0, 0, FrameWidth, FrameHeight, GraphicsUnit.Pixel, textAttributes);
+        } else {
+            e.Graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
+            e.Graphics.DrawImage(image, bounds, 0, 0, FrameWidth, FrameHeight, GraphicsUnit.Pixel);
+        }
     }
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) image.Dispose();
+        if (disposing) {
+            textScaler.Dispose();
+            textAttributes.Dispose();
+            image.Dispose();
+        }
         base.Dispose(disposing);
+    }
+}
+
+sealed class SharpFrameScaler : IDisposable
+{
+    struct Sample
+    {
+        public int Left;
+        public int Right;
+        public uint Weight;
+    }
+
+    readonly int sourceWidth;
+    readonly int sourceHeight;
+    readonly int[] gamma = new int[256];
+    readonly int[] sourceRow;
+    Sample[] columns;
+    Sample[] rows;
+    int[] horizontal;
+    int[] outputRow;
+    Bitmap output;
+    bool valid;
+
+    public SharpFrameScaler(int width, int height, double exponent)
+    {
+        sourceWidth = width;
+        sourceHeight = height;
+        sourceRow = new int[width];
+        for (int i = 0; i < gamma.Length; i++)
+            gamma[i] = (int)Math.Round(255 * Math.Pow(i / 255.0, exponent));
+    }
+
+    public void Invalidate()
+    {
+        valid = false;
+    }
+
+    static Sample[] BuildAxis(int input, int output)
+    {
+        var samples = new Sample[output];
+        double step = (double)input / output;
+        for (int i = 0; i < output; i++) {
+            double center = Math.Max(0, Math.Min(input - 1, (i + 0.5) * step - 0.5));
+            int left = (int)center;
+            double fraction = center - left;
+            double smooth = fraction * fraction * (3 - 2 * fraction);
+            // Keep a steeper center while blending more of the diagonal pixel edges.
+            double weight = 0.25 * fraction + 0.75 * smooth;
+            samples[i] = new Sample {
+                Left = left,
+                Right = Math.Min(left + 1, input - 1),
+                Weight = (uint)Math.Round(256 * weight)
+            };
+        }
+        return samples;
+    }
+
+    static int Blend(int left, int right, uint weight)
+    {
+        const uint redBlueMask = 0x00ff00ff;
+        const uint greenMask = 0x0000ff00;
+        unchecked {
+            uint a = (uint)left;
+            uint b = (uint)right;
+            uint inverse = 256 - weight;
+            uint redBlue = ((a & redBlueMask) * inverse + (b & redBlueMask) * weight + 0x00800080) >> 8;
+            uint green = ((a & greenMask) * inverse + (b & greenMask) * weight + 0x00008000) >> 8;
+            return (int)((redBlue & redBlueMask) | (green & greenMask));
+        }
+    }
+
+    public Bitmap Render(int[] rgb, Size size)
+    {
+        if (output == null || output.Size != size) {
+            var resized = new Bitmap(size.Width, size.Height, PixelFormat.Format32bppRgb);
+            if (output != null) output.Dispose();
+            output = resized;
+            columns = BuildAxis(sourceWidth, size.Width);
+            rows = BuildAxis(sourceHeight, size.Height);
+            horizontal = new int[size.Width * sourceHeight];
+            outputRow = new int[size.Width];
+            valid = false;
+        }
+        if (valid) return output;
+
+        int width = size.Width;
+        for (int y = 0; y < sourceHeight; y++) {
+            int sourceOffset = y * sourceWidth;
+            for (int x = 0; x < sourceWidth; x++) {
+                int color = rgb[sourceOffset + x];
+                sourceRow[x] = gamma[color >> 16] << 16 | gamma[(color >> 8) & 255] << 8 | gamma[color & 255];
+            }
+            int destOffset = y * width;
+            for (int x = 0; x < width; x++) {
+                Sample sample = columns[x];
+                horizontal[destOffset + x] = Blend(sourceRow[sample.Left], sourceRow[sample.Right], sample.Weight);
+            }
+        }
+
+        var data = output.LockBits(new Rectangle(Point.Empty, size), ImageLockMode.WriteOnly, PixelFormat.Format32bppRgb);
+        try {
+            for (int y = 0; y < size.Height; y++) {
+                Sample sample = rows[y];
+                int top = sample.Left * width;
+                int bottom = sample.Right * width;
+                IntPtr target = IntPtr.Add(data.Scan0, y * data.Stride);
+                if (sample.Weight == 0 || sample.Weight == 256) {
+                    Marshal.Copy(horizontal, sample.Weight == 0 ? top : bottom, target, width);
+                } else {
+                    for (int x = 0; x < width; x++)
+                        outputRow[x] = Blend(horizontal[top + x], horizontal[bottom + x], sample.Weight);
+                    Marshal.Copy(outputRow, 0, target, width);
+                }
+            }
+        } finally {
+            output.UnlockBits(data);
+        }
+        valid = true;
+        return output;
+    }
+
+    public void Dispose()
+    {
+        if (output != null) output.Dispose();
     }
 }
 
