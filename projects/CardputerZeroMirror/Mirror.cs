@@ -15,8 +15,8 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("Cardputer Zero 投屏")]
 [assembly: AssemblyProduct("Cardputer Zero 投屏")]
 [assembly: AssemblyDescription("通过 SSH 查看和操作 Cardputer Zero 的实体屏幕")]
-[assembly: AssemblyVersion("1.0.2.0")]
-[assembly: AssemblyFileVersion("1.0.2.0")]
+[assembly: AssemblyVersion("1.0.3.0")]
+[assembly: AssemblyFileVersion("1.0.3.0")]
 
 static class Program
 {
@@ -33,6 +33,9 @@ sealed class MirrorWindow : Form
 {
     readonly TextBox address = new TextBox { Width = 200, AccessibleName = "Zero 的 IP 地址" };
     readonly Button connect = new Button { Text = "连接", AutoSize = true };
+    readonly ComboBox scaling = new ComboBox {
+        Width = 120, DropDownStyle = ComboBoxStyle.DropDownList, AccessibleName = "画面缩放"
+    };
     readonly Label status = new Label { Dock = DockStyle.Fill, AutoEllipsis = true, TextAlign = ContentAlignment.MiddleLeft };
     readonly ScreenView screen = new ScreenView { Dock = DockStyle.Fill, TabStop = true };
     readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 33 };
@@ -59,6 +62,9 @@ sealed class MirrorWindow : Form
         toolbar.Controls.Add(new Label { Text = "设备地址", AutoSize = true, Margin = new Padding(0, 7, 6, 0) });
         toolbar.Controls.Add(address);
         toolbar.Controls.Add(connect);
+        scaling.Items.AddRange(new object[] { "整数倍", "适应窗口" });
+        scaling.SelectedIndex = 0;
+        toolbar.Controls.Add(scaling);
         var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3 };
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 43));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
@@ -70,6 +76,10 @@ sealed class MirrorWindow : Form
         Controls.Add(layout);
 
         connect.Click += delegate { if (session == null) StartConnection(); else Disconnect(); };
+        scaling.SelectedIndexChanged += delegate {
+            screen.FitViewport = scaling.SelectedIndex == 1;
+            UpdateConnectedStatus();
+        };
         address.KeyDown += delegate(object sender, KeyEventArgs args) {
             if (args.KeyCode == Keys.Enter && session == null) {
                 args.SuppressKeyPress = true;
@@ -253,28 +263,44 @@ sealed class ScreenView : Control
     readonly Bitmap image = new Bitmap(FrameWidth, FrameHeight, PixelFormat.Format32bppRgb);
     readonly int[] rgb = new int[FrameWidth * FrameHeight];
     bool hasFrame;
+    bool fitViewport;
+
+    public bool FitViewport
+    {
+        get { return fitViewport; }
+        set {
+            if (fitViewport == value) return;
+            fitViewport = value;
+            Invalidate();
+        }
+    }
 
     public string ResolutionText
     {
         get {
-            var bounds = ImageBounds(ClientSize);
-            double zoom = (double)bounds.Width / FrameWidth;
-            return String.Format("{0}×{1}   ·   {2:0.##}×", FrameWidth, FrameHeight, zoom);
+            var bounds = ImageBounds(ClientSize, FitViewport);
+            if (bounds.IsEmpty) return String.Format("{0}×{1}", FrameWidth, FrameHeight);
+            double zoom = Math.Max((double)bounds.Width / FrameWidth, (double)bounds.Height / FrameHeight);
+            return String.Format("{0}×{1} → {2}×{3}   ·   {4:0.##}×",
+                FrameWidth, FrameHeight, bounds.Width, bounds.Height, zoom);
         }
     }
 
-    internal static Rectangle ImageBounds(Size viewport)
+    internal static Rectangle ImageBounds(Size viewport, bool fitViewport = false)
     {
         if (viewport.Width <= 0 || viewport.Height <= 0) return Rectangle.Empty;
 
-        // Keep each source pixel the same size whenever the viewport fits the native frame.
         int zoom = Math.Min(viewport.Width / FrameWidth, viewport.Height / FrameHeight);
-        int width = FrameWidth * zoom;
-        int height = FrameHeight * zoom;
-        if (zoom == 0) {
-            double fit = Math.Min((double)viewport.Width / FrameWidth, (double)viewport.Height / FrameHeight);
-            width = Math.Max(1, (int)(FrameWidth * fit));
-            height = Math.Max(1, (int)(FrameHeight * fit));
+        int width, height;
+        if (!fitViewport && zoom > 0) {
+            width = FrameWidth * zoom;
+            height = FrameHeight * zoom;
+        } else if ((long)viewport.Width * FrameHeight <= (long)viewport.Height * FrameWidth) {
+            width = viewport.Width;
+            height = Math.Max(1, (int)((long)width * FrameHeight / FrameWidth));
+        } else {
+            height = viewport.Height;
+            width = Math.Max(1, (int)((long)height * FrameWidth / FrameHeight));
         }
         return new Rectangle((viewport.Width - width) / 2, (viewport.Height - height) / 2, width, height);
     }
@@ -338,7 +364,7 @@ sealed class ScreenView : Control
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
             return;
         }
-        Rectangle bounds = ImageBounds(ClientSize);
+        Rectangle bounds = ImageBounds(ClientSize, FitViewport);
         if (bounds.IsEmpty) return;
         e.Graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
         e.Graphics.PixelOffsetMode = PixelOffsetMode.Half;
