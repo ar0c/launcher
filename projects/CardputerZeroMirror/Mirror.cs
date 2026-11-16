@@ -15,8 +15,8 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("Cardputer Zero 投屏")]
 [assembly: AssemblyProduct("Cardputer Zero 投屏")]
 [assembly: AssemblyDescription("通过 SSH 查看和操作 Cardputer Zero 的实体屏幕")]
-[assembly: AssemblyVersion("1.0.6.0")]
-[assembly: AssemblyFileVersion("1.0.6.0")]
+[assembly: AssemblyVersion("1.0.7.0")]
+[assembly: AssemblyFileVersion("1.0.7.0")]
 
 static class Program
 {
@@ -448,16 +448,17 @@ sealed class SharpFrameScaler : IDisposable
     {
         var samples = new Sample[output];
         double step = (double)input / output;
-        // Blend near source pixel boundaries and keep flat areas intact.
-        double transition = Math.Max(0.5, 1.5 * step);
         for (int i = 0; i < output; i++) {
             double center = Math.Max(0, Math.Min(input - 1, (i + 0.5) * step - 0.5));
             int left = (int)center;
-            double weight = (center - left - 0.5) / transition + 0.5;
+            double fraction = center - left;
+            double smooth = fraction * fraction * (3 - 2 * fraction);
+            // Keep a steeper center while blending more of the diagonal pixel edges.
+            double weight = 0.25 * fraction + 0.75 * smooth;
             samples[i] = new Sample {
                 Left = left,
                 Right = Math.Min(left + 1, input - 1),
-                Weight = (uint)Math.Round(256 * Math.Max(0, Math.Min(1, weight)))
+                Weight = (uint)Math.Round(256 * weight)
             };
         }
         return samples;
