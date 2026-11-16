@@ -15,8 +15,8 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("Cardputer Zero 投屏")]
 [assembly: AssemblyProduct("Cardputer Zero 投屏")]
 [assembly: AssemblyDescription("通过 SSH 查看和操作 Cardputer Zero 的实体屏幕")]
-[assembly: AssemblyVersion("1.0.3.0")]
-[assembly: AssemblyFileVersion("1.0.3.0")]
+[assembly: AssemblyVersion("1.0.4.0")]
+[assembly: AssemblyFileVersion("1.0.4.0")]
 
 static class Program
 {
@@ -34,10 +34,12 @@ sealed class MirrorWindow : Form
     readonly TextBox address = new TextBox { Width = 200, AccessibleName = "Zero 的 IP 地址" };
     readonly Button connect = new Button { Text = "连接", AutoSize = true };
     readonly ComboBox scaling = new ComboBox {
-        Width = 120, DropDownStyle = ComboBoxStyle.DropDownList, AccessibleName = "画面缩放"
+        Width = 120, DropDownStyle = ComboBoxStyle.DropDownList, AccessibleName = "画面模式"
     };
     readonly Label status = new Label { Dock = DockStyle.Fill, AutoEllipsis = true, TextAlign = ContentAlignment.MiddleLeft };
-    readonly ScreenView screen = new ScreenView { Dock = DockStyle.Fill, TabStop = true };
+    readonly ScreenView screen = new ScreenView {
+        Dock = DockStyle.Fill, TabStop = true, Mode = ScreenScaleMode.TextEnhanced
+    };
     readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 33 };
     readonly HashSet<int> held = new HashSet<int>();
     readonly Stopwatch keepalive = Stopwatch.StartNew();
@@ -62,8 +64,8 @@ sealed class MirrorWindow : Form
         toolbar.Controls.Add(new Label { Text = "设备地址", AutoSize = true, Margin = new Padding(0, 7, 6, 0) });
         toolbar.Controls.Add(address);
         toolbar.Controls.Add(connect);
-        scaling.Items.AddRange(new object[] { "整数倍", "适应窗口" });
-        scaling.SelectedIndex = 0;
+        scaling.Items.AddRange(new object[] { "整数倍", "适应窗口", "文字增强" });
+        scaling.SelectedIndex = (int)screen.Mode;
         toolbar.Controls.Add(scaling);
         var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3 };
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 43));
@@ -77,7 +79,7 @@ sealed class MirrorWindow : Form
 
         connect.Click += delegate { if (session == null) StartConnection(); else Disconnect(); };
         scaling.SelectedIndexChanged += delegate {
-            screen.FitViewport = scaling.SelectedIndex == 1;
+            screen.Mode = (ScreenScaleMode)scaling.SelectedIndex;
             UpdateConnectedStatus();
         };
         address.KeyDown += delegate(object sender, KeyEventArgs args) {
@@ -255,6 +257,13 @@ static class DeviceAddress
     }
 }
 
+enum ScreenScaleMode
+{
+    Integer,
+    FitWindow,
+    TextEnhanced
+}
+
 sealed class ScreenView : Control
 {
     public const int FrameWidth = 320;
@@ -262,15 +271,16 @@ sealed class ScreenView : Control
     public const int FrameBytes = FrameWidth * FrameHeight * 2;
     readonly Bitmap image = new Bitmap(FrameWidth, FrameHeight, PixelFormat.Format32bppRgb);
     readonly int[] rgb = new int[FrameWidth * FrameHeight];
+    readonly ImageAttributes textAttributes = new ImageAttributes();
     bool hasFrame;
-    bool fitViewport;
+    ScreenScaleMode mode;
 
-    public bool FitViewport
+    public ScreenScaleMode Mode
     {
-        get { return fitViewport; }
+        get { return mode; }
         set {
-            if (fitViewport == value) return;
-            fitViewport = value;
+            if (mode == value) return;
+            mode = value;
             Invalidate();
         }
     }
@@ -278,7 +288,7 @@ sealed class ScreenView : Control
     public string ResolutionText
     {
         get {
-            var bounds = ImageBounds(ClientSize, FitViewport);
+            var bounds = ImageBounds(ClientSize, Mode == ScreenScaleMode.FitWindow);
             if (bounds.IsEmpty) return String.Format("{0}×{1}", FrameWidth, FrameHeight);
             double zoom = Math.Max((double)bounds.Width / FrameWidth, (double)bounds.Height / FrameHeight);
             return String.Format("{0}×{1} → {2}×{3}   ·   {4:0.##}×",
@@ -312,6 +322,8 @@ sealed class ScreenView : Control
         BackColor = Color.FromArgb(15, 19, 23);
         ForeColor = Color.FromArgb(211, 220, 228);
         AccessibleName = "Zero 屏幕及远程键盘";
+        textAttributes.SetWrapMode(WrapMode.TileFlipXY);
+        textAttributes.SetGamma(0.68f, ColorAdjustType.Bitmap);
     }
 
     protected override bool IsInputKey(Keys keyData)
@@ -364,16 +376,24 @@ sealed class ScreenView : Control
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
             return;
         }
-        Rectangle bounds = ImageBounds(ClientSize, FitViewport);
+        Rectangle bounds = ImageBounds(ClientSize, Mode == ScreenScaleMode.FitWindow);
         if (bounds.IsEmpty) return;
-        e.Graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
         e.Graphics.PixelOffsetMode = PixelOffsetMode.Half;
-        e.Graphics.DrawImage(image, bounds, 0, 0, FrameWidth, FrameHeight, GraphicsUnit.Pixel);
+        if (Mode == ScreenScaleMode.TextEnhanced) {
+            e.Graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            e.Graphics.DrawImage(image, bounds, 0, 0, FrameWidth, FrameHeight, GraphicsUnit.Pixel, textAttributes);
+        } else {
+            e.Graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
+            e.Graphics.DrawImage(image, bounds, 0, 0, FrameWidth, FrameHeight, GraphicsUnit.Pixel);
+        }
     }
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) image.Dispose();
+        if (disposing) {
+            textAttributes.Dispose();
+            image.Dispose();
+        }
         base.Dispose(disposing);
     }
 }
