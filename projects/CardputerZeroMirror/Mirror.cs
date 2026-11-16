@@ -15,8 +15,8 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("Cardputer Zero 投屏")]
 [assembly: AssemblyProduct("Cardputer Zero 投屏")]
 [assembly: AssemblyDescription("通过 SSH 查看和操作 Cardputer Zero 的实体屏幕")]
-[assembly: AssemblyVersion("1.0.1.0")]
-[assembly: AssemblyFileVersion("1.0.1.0")]
+[assembly: AssemblyVersion("1.0.2.0")]
+[assembly: AssemblyFileVersion("1.0.2.0")]
 
 static class Program
 {
@@ -45,6 +45,9 @@ sealed class MirrorWindow : Form
 
     public MirrorWindow()
     {
+        SuspendLayout();
+        AutoScaleDimensions = new SizeF(96f, 96f);
+        AutoScaleMode = AutoScaleMode.Dpi;
         Text = "Cardputer Zero 投屏";
         Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath);
         address.Text = DeviceAddress.Load(DeviceAddress.SettingsFile);
@@ -75,7 +78,9 @@ sealed class MirrorWindow : Form
         };
         screen.KeyDown += delegate(object sender, KeyEventArgs args) { Forward(args, true); };
         screen.KeyUp += delegate(object sender, KeyEventArgs args) { Forward(args, false); };
-        screen.LostFocus += delegate { ReleaseKeys(); };
+        screen.GotFocus += delegate { UpdateConnectedStatus(); };
+        screen.LostFocus += delegate { ReleaseKeys(); UpdateConnectedStatus(); };
+        screen.SizeChanged += delegate { UpdateConnectedStatus(); };
         Deactivate += delegate { ReleaseKeys(); };
         FormClosing += delegate {
             timer.Dispose();
@@ -90,6 +95,7 @@ sealed class MirrorWindow : Form
                 StartConnection();
             }
         };
+        ResumeLayout();
     }
 
     void StartConnection()
@@ -147,14 +153,22 @@ sealed class MirrorWindow : Form
         bool firstFrame = shownFrame == 0;
         if (session.CopyFrame(pixels, ref shownFrame)) {
             screen.ShowFrame(pixels);
-            if (firstFrame) DeviceAddress.Remember(DeviceAddress.SettingsFile, address.Text.Trim());
+            if (firstFrame) {
+                DeviceAddress.Remember(DeviceAddress.SettingsFile, address.Text.Trim());
+                UpdateConnectedStatus();
+            }
         }
-        status.Text = screen.Focused ? "键盘已连接   ·   方向键、Enter、Esc、Tab、数字与字母"
-                                     : "已连接   ·   点击画面启用按键转发";
         if (keepalive.ElapsedMilliseconds >= 1000) {
             session.Send(0, 1);
             keepalive.Restart();
         }
+    }
+
+    void UpdateConnectedStatus()
+    {
+        if (session == null || !session.Ready) return;
+        string inputStatus = screen.Focused ? "键盘已连接" : "点击画面启用按键转发";
+        status.Text = screen.ResolutionText + "   ·   " + inputStatus;
     }
 
     void Forward(KeyEventArgs args, bool down)
@@ -240,6 +254,31 @@ sealed class ScreenView : Control
     readonly int[] rgb = new int[FrameWidth * FrameHeight];
     bool hasFrame;
 
+    public string ResolutionText
+    {
+        get {
+            var bounds = ImageBounds(ClientSize);
+            double zoom = (double)bounds.Width / FrameWidth;
+            return String.Format("{0}×{1}   ·   {2:0.##}×", FrameWidth, FrameHeight, zoom);
+        }
+    }
+
+    internal static Rectangle ImageBounds(Size viewport)
+    {
+        if (viewport.Width <= 0 || viewport.Height <= 0) return Rectangle.Empty;
+
+        // Keep each source pixel the same size whenever the viewport fits the native frame.
+        int zoom = Math.Min(viewport.Width / FrameWidth, viewport.Height / FrameHeight);
+        int width = FrameWidth * zoom;
+        int height = FrameHeight * zoom;
+        if (zoom == 0) {
+            double fit = Math.Min((double)viewport.Width / FrameWidth, (double)viewport.Height / FrameHeight);
+            width = Math.Max(1, (int)(FrameWidth * fit));
+            height = Math.Max(1, (int)(FrameHeight * fit));
+        }
+        return new Rectangle((viewport.Width - width) / 2, (viewport.Height - height) / 2, width, height);
+    }
+
     public ScreenView()
     {
         SetStyle(ControlStyles.Selectable | ControlStyles.AllPaintingInWmPaint |
@@ -299,12 +338,11 @@ sealed class ScreenView : Control
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
             return;
         }
-        if (ClientSize.Width == 0 || ClientSize.Height == 0) return;
-        double scale = Math.Min((double)Width / FrameWidth, (double)Height / FrameHeight);
-        int w = (int)(FrameWidth * scale), h = (int)(FrameHeight * scale);
+        Rectangle bounds = ImageBounds(ClientSize);
+        if (bounds.IsEmpty) return;
         e.Graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
         e.Graphics.PixelOffsetMode = PixelOffsetMode.Half;
-        e.Graphics.DrawImage(image, new Rectangle((Width - w) / 2, (Height - h) / 2, w, h));
+        e.Graphics.DrawImage(image, bounds, 0, 0, FrameWidth, FrameHeight, GraphicsUnit.Pixel);
     }
 
     protected override void Dispose(bool disposing)

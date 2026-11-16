@@ -8,4 +8,6 @@ Windows x64 配套工具。通过 SSH 显示 Zero 的实体屏幕并转发键盘
 
 双击 EXE，填入 Zero 在 IP Panel 显示的地址，点击「连接」，然后点击画面启用按键转发。Windows 需要可用的 OpenSSH 客户端，`pi` 账户需已配置 SSH 公钥登录。首次连接前先核验 Zero 的 SSH 主机密钥，再用 OpenSSH 将其写入 `known_hosts`。Zero 端需要 Python 3，并允许 `pi` 读取屏幕和访问设备自带键盘。
 
+画面会按能放进窗口的最大整数倍显示，状态栏显示设备原始分辨率（320×170）和当前倍率。
+
 程序记住上次成功连接的地址。需要定制本机发行包时，可在构建前创建不提交到 Git 的 `connection.local.conf`。第一行填初始 IP，第二行可选填本机 `known_hosts` 中已核验的主机别名。
